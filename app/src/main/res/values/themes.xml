@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+    This is a base application theme. It is intentionally left minimal
+    to allow the Jetpack Compose theme in SmartRoverTheme.kt to take full control.
+    -->
+    <style name="Theme.SmartRover7" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
+    
