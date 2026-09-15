@@ -1,8 +1,18 @@
-# SmartRover7 - Full-Stack BLE Autonomous & RC Robotic Rover
+# SmartRover7 - Autonomous Multi-Modal Human-Following Robotic Rover
 
-An end-to-end full-stack IoT and robotics project featuring a physical robotic rover driven by an ESP32 microcontroller, paired with a custom Android client controller app built using Jetpack Compose and Kotlin.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform: ESP32](https://img.shields.io/badge/Platform-ESP32-blue.svg)](https://www.espressif.com/)
+[![Android: Jetpack Compose](https://img.shields.io/badge/Android-Jetpack%20Compose-green.svg)](https://developer.android.com/jetpack/compose)
+[![Language: C++ / Kotlin](https://img.shields.io/badge/Languages-C%2B%2B%20%7C%20Kotlin-orange.svg)]()
 
-The rover supports **three active operating modes**: BLE Smartphone Control, Autonomous BLE Beacon-Following, and remote RC Pilot Control via a FlySky RC Transmitter, complete with ultrasonic obstacle avoidance, differential mixing, and real-time telemetry.
+An end-to-end autonomous embedded robotics platform featuring a differential-drive mobile rover governed by an Espressif ESP32 dual-core microcontroller, paired with a custom native Android teleoperation and telemetry dashboard built using Jetpack Compose and Kotlin.
+
+The rover integrates **three operating modes**:
+1. **Autonomous BLE Beacon-Following**: Closed-loop proximity regulation using filtered signal attenuation.
+2. **FlySky RC Remote Pilot**: Direct PWM pulse-width capture with differential tank mixing.
+3. **BLE Smartphone Teleoperation**: Manual control over the Nordic UART Service (NUS).
+
+All modes are bound by an active real-time safety layer featuring ultrasonic emergency braking and asymmetric debounce state switching.
 
 ---
 
@@ -10,106 +20,122 @@ The rover supports **three active operating modes**: BLE Smartphone Control, Aut
 
 ```mermaid
 graph TD
-    subgraph Android App (Kotlin & Compose)
-        UI[User Dashboard UI] -->|Commands via NUS BLE| BLE_Mgr[BleConnectionManager]
+    subgraph Android App [Android Companion App (Kotlin & Jetpack Compose)]
+        UI[User Dashboard UI] -->|Command Packets via NUS BLE| BLE_Mgr[BleConnectionManager]
+        BeaconSvc[BeaconService / BLE Advertiser] -.->|iBeacon Frames| BLE_Scan
     end
     
-    subgraph ESP32 Rover Firmware
-        BLE_Server[BLE NUS Server] -->|Parse Writes| Mode_Ctrl[Mode Controller]
-        Ultrasonic[Ultrasonic Sensor] -->|Distance Check| Avoid[Avoidance Maneuver]
-        RC_Recv[FlySky RC Receiver] -->|PWM Pulse Capture| Tank_Mix[Differential Motor Mixer]
+    subgraph ESP32 [ESP32 Rover Firmware]
+        BLE_Server[GATT NUS Server] -->|Parse ASCII OpCodes| Mode_Ctrl[Mode Controller]
+        BLE_Scan[BLE Scan Engine] -->|Raw RSSI Stream| RSSI_Filter[IIR Exponential Filter]
+        RSSI_Filter -->|Smoothed RSSI| Prox_Reg[Proximity Regulator]
         
-        Mode_Ctrl -->|Set Speed/Dir| Motor_Drv[L298N Motor Driver]
-        Avoid -->|Override Stop/Reverse| Motor_Drv
-        Tank_Mix -->|Apply PWM Outputs| Motor_Drv
+        RC_Recv[FlySky RC Receiver] -->|PWM Pulse Capture| Hyst_Debounce[Asymmetric Debounce Logic]
+        Hyst_Debounce -->|RC Mode Transition| Tank_Mix[Differential Motor Mixer]
         
-        Telemetry[Serial Telemetry Engine] -->|Real-time Diagnostics| PC[USB Serial Debugger]
+        Ultrasonic[HC-SR04 Transducer] -->|Range <= 18 cm| Safety_Override[Emergency Safety Layer]
+        
+        Prox_Reg --> Motor_Drv[L298N H-Bridge Driver]
+        Mode_Ctrl --> Motor_Drv
+        Tank_Mix --> Motor_Drv
+        Safety_Override -->|Pre-emptive Brake / Pivot| Motor_Drv
     end
 ```
 
 ---
 
+## 🎛️ Control Algorithms & Mathematical Formulation
+
+### 1. First-Order IIR Exponential Smoothing on RSSI
+Raw Received Signal Strength Indication (RSSI) in interior environments experiences heavy multipath reflections and fading noise. To prevent actuator thrashing and distance estimation oscillation, raw signal readings are filtered through an exponential moving average (EMA / single-pole IIR filter):
+
+$$\text{RSSI}_{\text{filtered}} = \alpha \cdot \text{RSSI}_{\text{raw}} + (1 - \alpha) \cdot \text{RSSI}_{\text{prev}}$$
+
+where the filter smoothing factor is calibrated to:
+$$\alpha = 0.3$$
+
+This yields a smooth signal profile while maintaining sufficient phase responsiveness during user movement.
+
+### 2. Proximity Regulation State Machine
+The smoothed RSSI signal maps into non-linear PWM regimes ($60 \le \text{PWM} \le 255$) across three distinct operational zones:
+
+| Zone | RSSI Boundary | Commanded Behavior | PWM Mapping |
+| :--- | :--- | :--- | :--- |
+| **FAR** | $\text{RSSI} < -85\text{ dBm}$ | Rapid Catch-up Pursuit | $180 \le \text{PWM} \le 255$ |
+| **MEDIUM** | $-85\text{ dBm} \le \text{RSSI} \le -60\text{ dBm}$ | Proportional Deceleration Approach | $80 \le \text{PWM} \le 180$ |
+| **CLOSE** | $\text{RSSI} > -60\text{ dBm}$ | Equilibrium Safe Halt | $\text{PWM} = 0$ |
+
+*Collision Delta Guard:* A sudden RSSI surge ($> +8\text{ dBm}$ in a single sampling window) indicates the target is rapidly encroaching; the controller triggers an automatic reverse burst ($150\text{ PWM}$ for $250\text{ ms}$) to preserve target distance.
+
+### 3. Differential Tank Mixing (RC Mode)
+Dual-channel RC inputs capture steering ($\text{CH}_1$) and throttle ($\text{CH}_2$) PWM pulses ($1000\text{–}2000\,\mu\text{s}$, center neutral $1500\,\mu\text{s}$, deadband $\pm 100\,\mu\text{s}$). The signals are normalized and mapped through a differential drive kinematics mixer:
+
+$$\text{PWM}_{\text{Left}} = \text{clamp}\left(\text{Throttle} + \text{Steering}, -255, 255\right)$$
+$$\text{PWM}_{\text{Right}} = \text{clamp}\left(\text{Throttle} - \text{Steering}, -255, 255\right)$$
+
+This allows zero-radius turning when steering is commanded at zero net throttle.
+
+### 4. Asymmetric Temporal Debounce Hysteresis
+To prevent erratic oscillation between autonomous BLE and manual RC modes due to intermittent RF reception, an asymmetric temporal state machine regulates transitions:
+- **Autonomous $\to$ RC Override:** Requires stable, valid RC pulses for a continuous window of $\tau_{\text{engage}} \ge 300\text{ ms}$.
+- **RC $\to$ Autonomous Recovery:** Requires complete absence of RC carrier signal for $\tau_{\text{release}} \ge 500\text{ ms}$.
+- **Beacon Loss Timeout:** If the target BLE beacon is unobserved for $t > 3000\text{ ms}$, the rover immediately halts all motors and sounds an intermittent buzzer alert.
+
+### 5. Ultrasonic Safety Override
+Operating concurrently across all modes, an HC-SR04 sensor triggers an interrupt-like safety sequence when detecting any obstacle at $d \le 18\text{ cm}$:
+1. **Immediate Brake:** Actuator PWM driven to zero, buzzer sounded.
+2. **Reverse Extraction:** Both tracks driven backwards at $\text{PWM} = 150$ for $300\text{ ms}$.
+3. **Escape Pivot:** Executes a clockwise turn for $350\text{ ms}$ before yielding control back to the primary state machine.
+
+---
+
 ## 🔌 Hardware Configuration & Pinout
 
-| Component | Device Pin | ESP32 Pin | Function |
-|---|---|---|---|
-| **L298N Motor Driver** | IN1 | **GPIO 26** | Left Motor Forward |
-| | IN2 | **GPIO 25** | Left Motor Reverse |
-| | IN3 | **GPIO 33** | Right Motor Forward |
-| | IN4 | **GPIO 32** | Right Motor Reverse |
-| | ENA | **GPIO 27** | Left Motor Speed (PWM) |
-| | ENB | **GPIO 14** | Right Motor Speed (PWM) |
-| **HC-SR04 Ultrasonic** | TRIG | **GPIO 5** | Trigger Echo Pulse |
-| | ECHO | **GPIO 23** | Read Pulse Echo Time |
-| **FlySky RC Receiver** | CH1 | **GPIO 18** | PWM input (Steering) |
-| | CH2 | **GPIO 19** | PWM input (Throttle) |
-| **Feedback System** | LED_STATUS| **GPIO 2** | Connection/Mode status LED |
-| | LED_MODE | **GPIO 4** | Operation Mode LED |
-| | BUZZER | **GPIO 15** | Alert tone generator |
+| Subsystem | Device Pin | ESP32 GPIO | Description / Specifications |
+| :--- | :--- | :--- | :--- |
+| **L298N Dual H-Bridge** | `IN1` | **GPIO 26** | Left Motor Direction A |
+| | `IN2` | **GPIO 25** | Left Motor Direction B |
+| | `IN3` | **GPIO 33** | Right Motor Direction A |
+| | `IN4` | **GPIO 32** | Right Motor Direction B |
+| | `ENA` | **GPIO 27** | Left Motor Speed (LEDC PWM) |
+| | `ENB` | **GPIO 14** | Right Motor Speed (LEDC PWM) |
+| **HC-SR04 Rangefinder** | `TRIG` | **GPIO 5** | $10\,\mu\text{s}$ Ultrasound Trigger Pulse |
+| | `ECHO` | **GPIO 23** | Pulse Width Echo Capture |
+| **FlySky FS-iA6B Receiver** | `CH1` | **GPIO 18** | Steering Pulse ($1000\text{–}2000\,\mu\text{s}$) |
+| | `CH2` | **GPIO 19** | Throttle Pulse ($1000\text{–}2000\,\mu\text{s}$) |
+| **Telemetry & Feedback** | `LED_STATUS` | **GPIO 2** | Connection & Heartbeat Indicator |
+| | `LED_MODE` | **GPIO 4** | Active State Mode Indicator |
+| | `BUZZER` | **GPIO 15** | Audio Alerts (Collision / Beacon Loss) |
 
 ---
 
-## ⚙️ Operating Modes
+## 📱 Android Client Architecture
 
-### 1. BLE Manual Mode (Smartphone)
-The rover advertises as `SMARTROVER` and exposes the standard **Nordic UART Service (NUS)**. Mobile app directives are processed as byte packets sent to the RX Characteristic to command movements (`DRV:FWD`, `DRV:LEFT`, etc.) or dynamically scale speed (`SPD:VALUE`).
-
-### 2. BLE Follow Mode (Autonomous Tracking)
-In this mode, the rover acts as a BLE Scanner. It searches for active advertisement packages matching the target UUID `12345678-1234-5678-1234-567812345678` (a tracking beacon or phone).
-- **RSSI Filtering**: An Exponential Moving Average (EMA) filter is applied to the raw signal strength (RSSI) to smooth noise and prevent jitter:
-  $$\text{RSSI}_{\text{filtered}} = \alpha \cdot \text{RSSI}_{\text{raw}} + (1 - \alpha) \cdot \text{RSSI}_{\text{previous}}$$
-  *(where $\alpha = 0.3$)*
-- **Proximity Control**:
-  - **RSSI < -85 dBm (Far)**: Forward speed maps to high PWM (180–255) to catch up.
-  - **-85 to -60 dBm (Medium)**: Forward speed drops (80–180) for a steady approach.
-  - **> -60 dBm (Close)**: Motors stop.
-  - **Sudden RSSI Spike (> 8dB Increase)**: Triggers an immediate brief reverse maneuver to avoid collision if the beacon approaches too quickly.
-
-### 3. RC Transmitter Mode (FlySky Remote Control)
-Reads PWM signals from the RC receiver. Pulse duration is captured via `pulseIn` with a timeout of $25\text{ ms}$.
-- **Differential/Tank Mixing**: Standard mixing is applied to transform steer/throttle axes into independent left and right wheel speeds:
-  $$\text{LeftMotor} = \text{Constrain}(\text{Throttle} + \text{Steering}, -255, 255)$$
-  $$\text{RightMotor} = \text{Constrain}(\text{Throttle} - \text{Steering}, -255, 255)$$
-  This differential mixing allows the rover to pivot in place when steering is applied at neutral throttle.
-- **Hysteresis Auto-Switching**: When the phone is connected in manual mode, turning on the FlySky transmitter (detected by stable PWM pulses on RC pins for $> 300\text{ ms}$) automatically triggers the firmware to yield control to the RC Transmitter. Returning control to Manual Mode occurs if pulses are absent for $> 500\text{ ms}$.
-
-### 4. Safety Layer (Ultrasonic Obstacle Avoidance)
-Regardless of the active control mode, the ultrasonic distance sensor checks for barriers at regular intervals.
-- If distance drops below **18 cm**, a safety override is triggered:
-  1. The rover stops immediately and buzzes an alarm.
-  2. Backs up at speed 150 for $300\text{ ms}$.
-  3. Executes a right pivot for $350\text{ ms}$ to clear the path.
-  4. Returns control to the active mode engine.
+The companion Android application (`app/`) is architected with modern Android development standards:
+- **Jetpack Compose UI:** Reactive, single-activity layout displaying live RSSI, active mode indicators, speed sliders, and directional touch pads.
+- **BleConnectionManager:** Encapsulates GATT connection lifecycles, service discovery, MTU negotiation, and automated 3-stage reconnect routines.
+- **Nordic UART Protocol:**
+  - **Service UUID:** `6e400001-b5a3-f393-e0a9-e50e24dcca9e`
+  - **RX Characteristic:** `6e400002-b5a3-f393-e0a9-e50e24dcca9e` (Commands: `DRV:FWD`, `DRV:REV`, `DRV:STOP`, `SPD:<val>`)
+  - **TX Characteristic:** `6e400003-b5a3-f393-e0a9-e50e24dcca9e` (Telemetry Stream: RSSI, Mode, Obstacle Alert)
 
 ---
 
-## 📱 Mobile App Features
-- **Kotlin & Coroutines**: Handles async BLE callbacks on background threads to keep the UI smooth and responsive.
-- **StateFlow UI Binding**: Reacts instantly to connection events, scans, and system status (such as notifying when Bluetooth is disabled).
-- **Automated Connection Recovery**: Auto-reconnects up to 3 times on unexpected packet loss.
+## 🚀 Setup & Flashing
+
+### 1. ESP32 Firmware
+1. Open [`firmware/smart_rover_esp32/smart_rover_esp32.ino`](firmware/smart_rover_esp32/smart_rover_esp32.ino) in Arduino IDE.
+2. Under **Tools > Board**, select **ESP32 Dev Module**.
+3. Ensure the ESP32 BLE library is included in the board package.
+4. Compile and flash over USB at 115200 baud.
+
+### 2. Android Dashboard APK
+1. Open the project root in **Android Studio**.
+2. Sync Gradle dependencies.
+3. Build and deploy to an Android device (Android 8.0+ / API 26+).
+4. Enable Bluetooth and Location permissions, then connect to `SMARTROVER`.
 
 ---
-
-## 📂 Project Structure
-- **`app/`**: Gradle Kotlin Android Studio project source files.
-- **`firmware/smart_rover_esp32/`**: ESP32 C++ Arduino sketch:
-  - [`smart_rover_esp32.ino`](firmware/smart_rover_esp32/smart_rover_esp32.ino): The complete firmware implementation.
-
----
-
-## 🚀 Setup & Execution
-
-### 1. Uploading ESP32 Firmware
-1. Open [`smart_rover_esp32.ino`](firmware/smart_rover_esp32/smart_rover_esp32.ino) in the Arduino IDE.
-2. Install ESP32 board support via the Boards Manager.
-3. Select your ESP32 model (e.g. ESP32 Dev Module) and port.
-4. Upload the code to your hardware.
-
-### 2. Building the Android App
-1. Open the [`app/`](.) folder in Android Studio.
-2. Sync the project with Gradle.
-3. Build and install the APK on a physical Android device.
-4. Open the app, grant Bluetooth permissions, and tap **Connect** to link with the powered-on rover.
 
 ## 📄 License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is open-source under the [MIT License](LICENSE).
